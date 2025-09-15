@@ -1,98 +1,190 @@
+# app.py
 import streamlit as st
-import os
-from google_auth_oauthlib.flow import Flow
-from googleapiclient.discovery import build
-from google.oauth2.credentials import Credentials
+import imaplib, email, os, io, base64
+from email.header import decode_header
+from email.message import EmailMessage
 from PyPDF2 import PdfReader
 from docx import Document
-import base64
 
-SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+# Optional: Hugging Face summarizer (slow and heavy). Enable only if installed.
+USE_HF = st.sidebar.checkbox("Use HuggingFace summarizer (slow/heavy)", value=False)
+if USE_HF:
+    from transformers import pipeline
+    @st.cache_resource
+    def load_summarizer():
+        return pipeline("summarization", model="facebook/bart-large-cnn")
+    summarizer = load_summarizer()
+else:
+    summarizer = None
 
-st.set_page_config(page_title="Gmail Contract Generator", layout="wide")
-st.title("📧 Gmail → Contract Generator")
+st.set_page_config(page_title="IMAP Gmail → Contract Generator", layout="wide")
+st.title("📧 Gmail (IMAP) → Contract Generator (App-password flow)")
 
-# --- STEP 1: Upload Google OAuth credentials.json ---
-st.sidebar.header("Setup")
-uploaded = st.sidebar.file_uploader("Upload your Google OAuth credentials.json", type="json")
-if uploaded:
-    with open("credentials.json", "wb") as f:
-        f.write(uploaded.read())
-    st.sidebar.success("✅ credentials.json uploaded!")
-
-# --- STEP 2: Authenticate Gmail ---
-if os.path.exists("credentials.json"):
-    if "creds" not in st.session_state:
-        flow = Flow.from_client_secrets_file(
-    "credentials.json",
-    scopes=SCOPES,
-    redirect_uri="https://gmail-contract-generator-dnsfvhdx9ver7ent5csome.streamlit.app/"
+st.markdown(
+    """
+**Important:** For Gmail you should create an **App password** (Google Account → Security → App passwords).
+Do **not** enter your primary password unless you understand the risks.
+"""
 )
 
-        auth_url, _ = flow.authorization_url(prompt="consent")
-        st.sidebar.markdown(f"[🔑 Click here to login to Gmail]({auth_url})")
-        code = st.sidebar.text_input("Paste Google authorization code here:")
-        if code:
-            flow.fetch_token(code=code)
-            st.session_state.creds = flow.credentials
-            st.sidebar.success("✅ Authentication successful!")
+with st.sidebar.form("connect_form"):
+    st.write("### Connect your Gmail (IMAP)")
+    user_email = st.text_input("Gmail address", placeholder="you@gmail.com")
+    user_pass = st.text_input("App password (or password)", type="password")
+    mailbox = st.selectbox("Mailbox", ["INBOX", "ALL"], index=0)
+    max_fetch = st.number_input("Emails to fetch", min_value=1, max_value=50, value=10)
+    connect = st.form_submit_button("Connect")
 
-# --- STEP 3: Fetch Emails ---
-if "creds" in st.session_state:
-    service = build("gmail", "v1", credentials=st.session_state.creds)
-    results = service.users().messages().list(
-        userId="me", labelIds=["INBOX"], q="is:unread", maxResults=10
-    ).execute()
-    messages = results.get("messages", [])
+imap_client = None
+messages_list = []
+if connect:
+    if not user_email or not user_pass:
+        st.error("Please enter email and app password.")
+    else:
+        try:
+            st.info("Connecting to imap.gmail.com ...")
+            imap_client = imaplib.IMAP4_SSL("imap.gmail.com")
+            imap_client.login(user_email, user_pass)
+            if mailbox == "INBOX":
+                imap_client.select("INBOX")
+            else:
+                imap_client.select()  # default
 
-    if messages:
-        # Dropdown to select email
-        email_map = {}
-        for msg in messages:
-            m = service.users().messages().get(userId="me", id=msg["id"]).execute()
-            snippet = m.get("snippet", "No preview")
-            email_map[snippet[:80]] = m
-        selected = st.selectbox("📩 Select an email", list(email_map.keys()))
+            typ, data = imap_client.search(None, 'ALL')  # or 'UNSEEN'
+            ids = data[0].split()[::-1]  # newest first
+            ids = ids[:max_fetch]
+            st.success(f"Connected. Found {len(ids)} messages. (showing latest {len(ids)})")
 
-        chosen_email = email_map[selected]
-        st.subheader("Email Content")
-        st.write(chosen_email["snippet"])
+            # fetch basics
+            for i, mid in enumerate(ids):
+                typ, msg_data = imap_client.fetch(mid, "(RFC822)")
+                raw = msg_data[0][1]
+                msg = email.message_from_bytes(raw)
+                subj, _ = decode_header(msg.get("Subject", ""))[0]
+                if isinstance(subj, bytes):
+                    subj = subj.decode(errors="ignore")
+                from_ = msg.get("From", "")
+                preview = msg.get("Date", "")  # minimal preview for dropdown key
+                key = f"{i+1}: {subj} — {from_}"
+                messages_list.append((key, mid, msg))
+        except imaplib.IMAP4.error as e:
+            st.error(f"IMAP error: {e}")
+        except Exception as e:
+            st.error(f"Connection failed: {e}")
 
-        # --- STEP 4: Fetch attachments ---
-        parts = chosen_email.get("payload", {}).get("parts", [])
-        attachments_text = ""
-        for part in parts:
-            if part.get("filename"):
-                att_id = part["body"].get("attachmentId")
-                if att_id:
-                    att = service.users().messages().attachments().get(
-                        userId="me", messageId=chosen_email["id"], id=att_id
-                    ).execute()
-                    file_data = base64.urlsafe_b64decode(att["data"])
-                    fname = part["filename"]
+# If connected and messages_list filled
+if messages_list:
+    keys = [m[0] for m in messages_list]
+    selected = st.selectbox("Select an email to process", keys)
+    sel_idx = keys.index(selected)
+    _, sel_mid, sel_msg = messages_list[sel_idx]
 
-                    # Save and extract text if PDF/DOCX
-                    with open(fname, "wb") as f:
-                        f.write(file_data)
-                    if fname.endswith(".pdf"):
-                        reader = PdfReader(fname)
-                        for page in reader.pages:
-                            attachments_text += page.extract_text() + "\n"
-                    elif fname.endswith(".docx"):
-                        doc = Document(fname)
-                        for para in doc.paragraphs:
-                            attachments_text += para.text + "\n"
+    # Show subject/from/body snippet
+    st.subheader("Email preview")
+    subj = sel_msg.get("Subject", "")
+    from_ = sel_msg.get("From", "")
+    st.markdown(f"**Subject:** {subj}  \n**From:** {from_}")
+    # get plain text body if available
+    def get_body(message):
+        if message.is_multipart():
+            for part in message.walk():
+                ctype = part.get_content_type()
+                disp = str(part.get("Content-Disposition"))
+                if ctype == "text/plain" and "attachment" not in disp:
+                    return part.get_payload(decode=True).decode(errors="ignore")
+        else:
+            return message.get_payload(decode=True).decode(errors="ignore")
+        return ""
+    body_text = get_body(sel_msg) or "(no body text found)"
+    st.text_area("Body (plain text)", body_text, height=200)
 
-        # --- STEP 5: Generate contract ---
-        if st.button("Generate Contract"):
+    # Download attachments (in-memory)
+    attachments_text = ""
+    attachments = []
+    for part in sel_msg.walk():
+        if part.get_content_maintype() == "multipart":
+            continue
+        if part.get("Content-Disposition") is None:
+            continue
+        filename = part.get_filename()
+        if filename:
+            payload = part.get_payload(decode=True)
+            # save to temp file in memory
+            attachments.append((filename, payload))
+            st.write(f"Attachment found: {filename}")
+
+            # Extract text from common types
+            if filename.lower().endswith(".pdf"):
+                try:
+                    reader = PdfReader(io.BytesIO(payload))
+                    for page in reader.pages:
+                        text = page.extract_text()
+                        if text:
+                            attachments_text += text + "\n"
+                except Exception as e:
+                    st.warning(f"Could not extract PDF text from {filename}: {e}")
+            elif filename.lower().endswith(".docx"):
+                try:
+                    # write to temp on disk then read via python-docx
+                    with open("/tmp/_temp.docx", "wb") as tf:
+                        tf.write(payload)
+                    doc = Document("/tmp/_temp.docx")
+                    for p in doc.paragraphs:
+                        attachments_text += p.text + "\n"
+                    os.remove("/tmp/_temp.docx")
+                except Exception as e:
+                    st.warning(f"Could not extract DOCX text from {filename}: {e}")
+            elif filename.lower().endswith(".txt"):
+                try:
+                    attachments_text += payload.decode(errors="ignore") + "\n"
+                except:
+                    pass
+            else:
+                st.info(f"Unsupported attachment type for text extraction: {filename}")
+
+    st.subheader("Extracted text from attachments")
+    st.text_area("Attachments extracted text", attachments_text, height=200)
+
+    # Summarize
+    def simple_summary(text, max_chars=800):
+        return text[:max_chars] + ("..." if len(text) > max_chars else "")
+
+    if st.button("Summarize & Generate contract"):
+        combined_text = body_text + "\n\n" + attachments_text
+        if not combined_text.strip():
+            st.error("No content to summarize from this email/attachments.")
+        else:
+            if summarizer:
+                # HF model expects shorter inputs; for long docs you should chunk
+                try:
+                    s = summarizer(combined_text, max_length=150, min_length=40, do_sample=False)
+                    summary = s[0]["summary_text"]
+                except Exception as e:
+                    st.warning(f"HuggingFace summarizer failed: {e}. Falling back to simple summary.")
+                    summary = simple_summary(combined_text)
+            else:
+                summary = simple_summary(combined_text)
+
+            # Create a DOCX contract
             contract = Document()
-            contract.add_heading("Generated Contract", 0)
-            contract.add_paragraph("Email summary: " + chosen_email["snippet"])
-            if attachments_text:
-                contract.add_heading("Extracted from Attachments", level=1)
+            contract.add_heading("Generated Contract", level=0)
+            contract.add_paragraph("Based on the selected email and attachments.")
+            contract.add_heading("Summary", level=1)
+            contract.add_paragraph(summary)
+            contract.add_heading("Original Email Body", level=1)
+            contract.add_paragraph(body_text)
+            if attachments_text.strip():
+                contract.add_heading("Attachments (extracted)", level=1)
                 contract.add_paragraph(attachments_text)
-            output_file = "contract.docx"
-            contract.save(output_file)
 
-            with open(output_file, "rb") as f:
-                st.download_button("⬇️ Download Contract", f, file_name="contract.docx")
+            out_name = "generated_contract.docx"
+            contract.save(out_name)
+
+            # Provide download
+            with open(out_name, "rb") as f:
+                data = f.read()
+            b64 = base64.b64encode(data).decode()
+            href = f'<a href="data:application/octet-stream;base64,{b64}" download="{out_name}">⬇️ Download contract.docx</a>'
+            st.markdown(href, unsafe_allow_html=True)
+
+            st.success("Contract generated. Click download link above.")
