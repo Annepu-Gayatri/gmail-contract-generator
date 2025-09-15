@@ -24,10 +24,11 @@ if uploaded:
 if os.path.exists("credentials.json"):
     if "creds" not in st.session_state:
         flow = Flow.from_client_secrets_file(
-            "credentials.json",
-            scopes=SCOPES,
-            redirect_uri=st.secrets.get("REDIRECT_URI", "http://localhost:8501/")
-        )
+    "credentials.json",
+    scopes=SCOPES,
+    redirect_uri="https://gmail-contract-generator-dnsfvhdx9ver7ent5csome.streamlit.app/"
+)
+
         auth_url, _ = flow.authorization_url(prompt="consent")
         st.sidebar.markdown(f"[🔑 Click here to login to Gmail]({auth_url})")
         code = st.sidebar.text_input("Paste Google authorization code here:")
